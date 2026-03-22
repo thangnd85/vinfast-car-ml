@@ -1,6 +1,6 @@
 import os
 
-DOMAIN = "vinfast_test"
+DOMAIN = "vinfast"
 CONF_EMAIL = "email"
 CONF_PASSWORD = "password"
 CONF_GEMINI_API_KEY = "gemini_api_key"

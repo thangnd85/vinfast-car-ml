@@ -157,11 +157,11 @@ class VinFastSensor(SensorEntity):
 
             elif self._device_key == "api_trip_route":
                 self._attr_native_value = "Dữ liệu Map" if vi else "Map Data"
-                self._attr_extra_state_attributes = {"route_json": str(val)}
+                self._attr_extra_state_attributes = {"route_json": val if isinstance(val, str) else json.dumps(val)}
                 
             elif self._device_key == "api_nearby_stations":
                 self._attr_native_value = "Danh sách Trạm" if vi else "Station List"
-                self._attr_extra_state_attributes = {"stations": str(val)}
+                self._attr_extra_state_attributes = {"stations": val if isinstance(val, str) else json.dumps(val)}
                 
             elif self._device_key == "api_public_charge_sessions":
                 self._attr_native_value = val
@@ -198,11 +198,28 @@ class VinFastSensor(SensorEntity):
                 self._attr_extra_state_attributes = {"full_text": val_str}
                 self._attr_native_value = val_str[:250] + "..." if len(val_str) > 250 else val_str
 
+            # BẢN VÁ: Gộp chính xác Số lần sạc để miễn nhiễm lỗi restart
+            elif self._device_key == "api_total_charge_sessions":
+                try:
+                    pub = int(float(self.api._last_data.get("api_public_charge_sessions", 0)))
+                    home = int(float(self.api._last_data.get("api_home_charge_sessions", 0)))
+                    self._attr_native_value = pub + home
+                    self._attr_extra_state_attributes = {
+                        "Sạc tại trạm": pub,
+                        "Sạc tại nhà": home
+                    }
+                except Exception:
+                    self._attr_native_value = val
+
+            # BẢN VÁ: Đổ toàn bộ Dictionary vào Attribute để HA kẻ bảng hiển thị
             elif self._device_key == "api_debug_raw":
                 try:
-                    log_str = self.api._last_data.get("api_debug_raw_json", "{}")
-                    self._attr_extra_state_attributes = {"Chi tiết" if vi else "Details": str(log_str)[:1000]}
-                    val_str = str(val) if val else ("Đang khởi động..." if vi else "Booting...")
+                    raw_dict = getattr(self.api, '_raw_json_dict', {})
+                    if raw_dict:
+                        self._attr_extra_state_attributes = raw_dict.copy()
+                    else:
+                        self._attr_extra_state_attributes = {"Trạng thái": "Chờ bản tin MQTT..."}
+                    val_str = str(val) if val else "Đang hoạt động"
                     self._attr_native_value = val_str[:250] + "..." if len(val_str) > 250 else val_str
                 except Exception: pass
                 

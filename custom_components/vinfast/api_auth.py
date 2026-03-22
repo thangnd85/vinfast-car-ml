@@ -70,10 +70,19 @@ class AuthManager:
                 self.core.vehicle_model_display = v.get("marketingName") or v.get("dmsVehicleModel") or "VF"
                 self.core._last_data["api_vehicle_model"] = self.core.vehicle_model_display
                 
+                # BẢN VÁ: Ưu tiên Biển số xe làm tên định danh
+                plate = v.get("licensePlate")
                 custom_name = v.get("customizedVehicleName")
-                if custom_name and len(custom_name) > 1:
+                
+                if plate and len(str(plate)) > 3 and str(plate).lower() != "vinfast":
+                    self.core.vehicle_name = plate
+                    self.core._last_data["api_vehicle_name"] = plate
+                    self.core._last_data["34181_00001_00007"] = plate
+                elif custom_name and len(str(custom_name)) > 1 and not str(custom_name).isnumeric() and str(custom_name).lower() != "vinfast":
                     self.core.vehicle_name = custom_name
                     self.core._last_data["api_vehicle_name"] = custom_name
+                else:
+                    self.core._last_data["api_vehicle_name"] = self.core.vehicle_model_display
                 
                 profile = get_vehicle_profile(self.core.vehicle_model_display)
                 self.core._active_sensors = profile["sensors"]
@@ -135,7 +144,10 @@ class AuthManager:
             active_dict = getattr(self.core, '_active_sensors', {})
             reqs = [{"objectId": str(int(k.split("_")[0])), "instanceId": str(int(k.split("_")[1])), "resourceId": str(int(k.split("_")[2]))} for k in active_dict.keys() if "_" in k and not k.startswith("api_")]
             
-            extra_resources = [("34180", "00001", "00010"), ("34181", "00001", "00010"), ("34183", "00001", "00010"), ("34193", "00001", "00012"), ("34193", "00001", "00014"), ("34193", "00001", "00019")]
+            extra_resources = [
+                ("34180", "00001", "00010"), ("34181", "00001", "00010"), ("34183", "00001", "00010"),
+                ("34193", "00001", "00012"), ("34193", "00001", "00014"), ("34193", "00001", "00019")
+            ]
             for obj, inst, res in extra_resources:
                 item = {"objectId": obj, "instanceId": inst, "resourceId": res}
                 if item not in reqs: reqs.append(item)
@@ -189,6 +201,31 @@ class AuthManager:
             
             return f"wss://{self.core.iot_endpoint}/mqtt?{query_params}&X-Amz-Signature={signature}&X-Amz-Security-Token={urllib.parse.quote(creds['SessionToken'], safe='')}"
         except Exception: return None
+
+    def fetch_active_charging_session(self):
+        try:
+            if not self.core.vin or not self.core.access_token: return False
+            api_path = "ccarcharging/api/v1/charging-sessions/active"
+            ts = int(time.time() * 1000)
+            headers = self._get_base_headers()
+            headers.update({
+                "X-HASH": self._generate_x_hash("GET", api_path, self.core.vin, ts), 
+                "X-HASH-2": self._generate_x_hash_2("android", self.core.vin, DEVICE_ID, api_path, "GET", ts), 
+                "X-TIMESTAMP": str(ts)
+            })
+            res = requests.get(f"{self.core.api_base}/{api_path}", headers=headers, timeout=10)
+            if res and res.status_code == 200:
+                data = res.json().get("data")
+                if data:
+                    power = safe_float(data.get("chargingPower", 0))
+                    target = safe_float(data.get("targetBatteryLevel", 0))
+                    if target > 0: self.core._last_data["api_target_charge_limit"] = target
+                    if power > 0:
+                        self.core._last_data["api_live_charge_power"] = power
+                        self.core._current_charge_max_power = max(getattr(self.core, '_current_charge_max_power', 0.0), power)
+                        return True
+        except Exception: pass
+        return False
 
     def fetch_nearby_stations(self):
         try:
@@ -287,25 +324,19 @@ class AuthManager:
                         self.core._last_data["api_public_charge_energy"] = round(public_energy, 2)
                         home_kwh = safe_float(self.core._last_data.get("api_home_charge_kwh", 0.0))
                         self.core._last_data["api_total_energy_charged"] = round(public_energy + home_kwh, 2)
-                        
-                        total_calc_cap = 0
-                        valid_cap_count = 0
-                        for s in valid_sessions[:5]:
-                            s_start = safe_float(s.get("startBatteryLevel", 0))
-                            s_end = safe_float(s.get("endBatteryLevel", 0))
-                            s_kwh = safe_float(s.get("totalKWCharged", 0))
-                            s_delta = s_end - s_start
-                            if s_delta >= 10.0 and s_kwh > 0: 
-                                calc_capacity = ((s_kwh * 0.92) / s_delta) * 100.0
-                                total_calc_cap += calc_capacity
-                                valid_cap_count += 1
-                                
-                        if valid_cap_count > 0:
-                            avg_cap = total_calc_cap / valid_cap_count
+
+                        # --- BẢN VÁ: TÍNH HIỆU SUẤT SẠC DC TRẠM ---
+                        if valid_sessions:
+                            last_s = valid_sessions[0]
+                            s_start = safe_float(last_s.get("startBatteryLevel", 0))
+                            s_end = safe_float(last_s.get("endBatteryLevel", 0))
+                            s_kwh = safe_float(last_s.get("totalKWCharged", 0))
                             spec_cap = getattr(self.core, '_vehicle_spec', {}).get("capacity", 0)
-                            if spec_cap > 0:
-                                soh = min((avg_cap / spec_cap) * 100.0, 100.0)
-                                self.core._last_data["api_soh_calculated"] = round(soh, 1)
+                            if (s_end - s_start) > 0 and s_kwh > 0 and spec_cap > 0:
+                                theo_kwh = ((s_end - s_start) / 100.0) * spec_cap
+                                eff = (theo_kwh / s_kwh) * 100.0
+                                self.core._last_data["api_last_charge_efficiency"] = round(min(eff, 100.0), 1)
+                                self.core._last_data["api_last_charge_energy"] = round(s_kwh, 2)
 
                         self.core._calculate_advanced_stats()
                         self.core._save_state()

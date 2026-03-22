@@ -1,5 +1,5 @@
 {
-  "domain": "vinfast_car",
+  "domain": "vinfast",
   "name": "VinFast Car",
   "codeowners": ["@thangnd85"],
   "config_flow": true,
@@ -8,5 +8,5 @@
   "iot_class": "cloud_polling",
   "integration_type": "hub",
   "requirements": ["paho-mqtt>=1.6.1", "requests>=2.28.1"],
-  "version": "1.0"
+  "version": "3.0"
 }

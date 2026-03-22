@@ -102,6 +102,14 @@ class MQTTManager:
                     self._needs_mqtt_renew = True
                     core._last_mqtt_msg_time = now 
 
+                if getattr(core, '_is_charging', False):
+                    if now - getattr(self, '_last_active_charge_fetch', 0) >= 60:
+                        self._last_active_charge_fetch = now
+                        has_api_power = core.auth.fetch_active_charging_session()
+                        if has_api_power:
+                            core._last_api_power_time = now 
+                        core.trigger_callbacks()
+
                 if getattr(core, '_vehicle_offline', False):
                     time_since_last_wakeup = now - getattr(core, '_last_auto_wakeup_time', 0)
                     if time_since_last_wakeup > 180:
@@ -171,7 +179,7 @@ class MQTTManager:
         core = self.core
         try:
             if not getattr(core, 'gemini_api_key', None) or core.gemini_api_key.strip() == "":
-                return # Đã Disabled, bỏ qua
+                return 
                 
             std_range = safe_float(core._last_data.get("api_static_range", 210))
             expected_km_per_1 = round(std_range / 100.0, 2) if std_range > 0 else 2.1
@@ -215,12 +223,10 @@ class MQTTManager:
                 "34193_00001_00012", "34193_00001_00014", "34193_00001_00019", "34220_00001_00001", 
                 "34183_00001_00005", "00006_00001_00000", "00006_00001_00001"  
             ]
-            if key in no_zero_keys and c_val_float <= 0.0001 and f_val_float > 0:
-                return fallback_val
+            if key in no_zero_keys and c_val_float <= 0.0001 and f_val_float > 0: return fallback_val
 
             odo_keys = ["34183_00001_00003", "34199_00000_00000"]
-            if key in odo_keys and c_val_float < f_val_float:
-                return fallback_val
+            if key in odo_keys and c_val_float < f_val_float: return fallback_val
         except Exception: pass
         return current_val
 
@@ -273,8 +279,7 @@ class MQTTManager:
             core._last_data["api_debug_raw"] = f"Nhận: {len(data_dict)} mã ({time_str})"
             
             for k in ["34180_00001_00010", "34183_00001_00010", "34181_00001_00007"]:
-                if k in data_dict and isinstance(data_dict[k], str):
-                    core._update_vehicle_name(data_dict[k])
+                if k in data_dict and isinstance(data_dict[k], str): core._update_vehicle_name(data_dict[k])
                 
         except Exception: return
 
@@ -362,6 +367,14 @@ class MQTTManager:
                             energy_used = ((core._trip_start_soc - current_soc) / 100.0) * cap
                             core._last_data["api_trip_energy_used"] = round(energy_used, 2)
                             core._last_data["api_trip_efficiency"] = round((energy_used / final_trip_dist) * 100, 2)
+                            
+                            cost_per_kwh = safe_float(core.options.get("cost_per_kwh", 4000))
+                            core._last_data["api_trip_charge_cost"] = round(energy_used * cost_per_kwh)
+
+                    gas_km_per_liter = getattr(core, 'gas_km_per_liter', 15.0)
+                    gas_price = safe_float(core.options.get("gas_price", 20000))
+                    if gas_km_per_liter > 0:
+                        core._last_data["api_trip_gas_cost"] = round((final_trip_dist / gas_km_per_liter) * gas_price)
 
         except Exception: pass
 
@@ -434,6 +447,11 @@ class MQTTManager:
             elif is_fully_charged: core._last_data["api_vehicle_status"] = "Đã sạc xong" if vi else "Fully Charged"
             else: core._last_data["api_vehicle_status"] = base_status
 
+            if getattr(core, '_is_first_mqtt_message', True):
+                core._is_first_mqtt_message = False
+                if not is_charging:
+                    core._last_is_charging = False
+
         except Exception as e: pass
 
         try:
@@ -445,6 +463,7 @@ class MQTTManager:
                     core._charge_start_soc = current_soc
                 else:
                     core._charge_start_soc = safe_float(core._last_data.get("api_last_charge_start_soc", 0))
+
                 core._charge_calc_soc = core._charge_start_soc
                 core._charge_start_time = current_time
                 core._charge_calc_time = current_time
@@ -470,11 +489,13 @@ class MQTTManager:
                         if delta_time_hrs > 0.002: 
                             power = (delta_soc / 100.0) * cap / delta_time_hrs
                             if 0 < power < 360: 
-                                core._last_data["api_live_charge_power"] = round(power, 1)
+                                if current_time - getattr(core, '_last_api_power_time', 0) > 120:
+                                    core._last_data["api_live_charge_power"] = round(power, 1)
                                 core._current_charge_max_power = max(getattr(core, '_current_charge_max_power', 0.0), power)
                                 core._last_data["34183_00000_00012"] = round(power, 1)
                     else:
-                        core._last_data["api_live_charge_power"] = 0.0
+                        if current_time - getattr(core, '_last_api_power_time', 0) > 120:
+                            core._last_data["api_live_charge_power"] = 0.0
 
                     core._charge_calc_soc = current_soc
                     core._charge_calc_time = current_time
@@ -497,6 +518,10 @@ class MQTTManager:
                     cap = safe_float(core._last_data.get("api_static_capacity", 18.64))
                     if cap == 0: cap = 18.64
                     added_kwh = (delta_soc / 100.0) * cap
+                    
+                    # --- BẢN VÁ: TÍNH ĐIỆN NĂNG LƯỚI & HIỆU SUẤT SẠC AC MẶC ĐỊNH ---
+                    core._last_data["api_last_charge_energy"] = round(added_kwh / 0.92, 2)
+                    core._last_data["api_last_charge_efficiency"] = 92.0
                     
                     is_home_charge = False
                     max_pwr = getattr(core, '_current_charge_max_power', 0.0)
@@ -530,7 +555,6 @@ class MQTTManager:
                             core._last_data["api_home_charge_sessions"] = int(core._last_data.get("api_home_charge_sessions", 0)) + 1
                             core._last_data["api_home_charge_kwh"] = round(float(core._last_data.get("api_home_charge_kwh", 0.0)) + added_kwh, 2)
                         
-                        core._last_data["api_total_charge_sessions"] = int(core._last_data.get("api_public_charge_sessions", 0)) + int(core._last_data.get("api_home_charge_sessions", 0))
                         core._save_state()
                         core.trigger_callbacks()
 

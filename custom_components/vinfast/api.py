@@ -128,8 +128,8 @@ class VinFastAPI:
     def _update_vehicle_name(self, candidate_name):
         if not candidate_name: return
         candidate = str(candidate_name).strip()
-        if len(candidate) < 2 or candidate.isnumeric() or candidate in ["0", "1"]: return
-        if candidate.lower() in ["none", "null", "unknown", "xevinfast"] or "profile_email" in candidate.lower(): return
+        if len(candidate) < 2 or candidate.isnumeric() or candidate.lower() in ["0", "1", "none", "null", "unknown", "vinfast"]: return
+        if "profile_email" in candidate.lower(): return
         self._last_data["api_vehicle_name"] = candidate
 
     def inject_mock_data(self, payload_list):
@@ -145,12 +145,15 @@ class VinFastAPI:
         elif action == "rs": self.inject_mock_data([{"deviceKey": "34193_00001_00005", "value": "2"}, {"deviceKey": "34183_00000_00001", "value": "2"}])
         elif action == "soc" and len(parts) > 1: self.inject_mock_data([{"deviceKey": "34183_00001_00009", "value": parts[1]}, {"deviceKey": "34180_00001_00011", "value": parts[1]}])
         elif action == "ai": threading.Thread(target=self.mqtt._run_ai_advisor_wrapper, args=("trip", {"dist": 15.5, "drop": 6.0}), daemon=True).start()
+        # Cho phép ép chạy lại thuật toán sửa Map bằng tay thông qua mock console
+        elif action == "fix_map": threading.Thread(target=self.fix_historical_trips, daemon=True).start()
 
     def _calculate_advanced_stats(self):
         try:
             target_spec = getattr(self, '_vehicle_spec', {"capacity": 0, "range": 0})
             cap = target_spec.get("capacity", 0)
             ran = target_spec.get("range", 0)
+            
             if cap > 0:
                 self._last_data["api_static_capacity"] = cap
                 self._last_data["api_static_range"] = ran
@@ -181,7 +184,67 @@ class VinFastAPI:
                 else:
                     soh_raw = safe_float(self._last_data.get("34220_00001_00001", 100))
                     self._last_data["api_soh_calculated"] = round(soh_raw, 1)
+                    
+            batt_pct = safe_float(self._last_data.get("34183_00001_00009", self._last_data.get("34180_00001_00011", 0)))
+            calc_max = safe_float(self._last_data.get("api_calc_max_range", 0))
+            
+            if calc_max > 0:
+                self._last_data["api_calc_range_per_percent"] = round(calc_max / 100.0, 2)
+                if batt_pct > 0: self._last_data["api_calc_remain_range"] = round(calc_max * (batt_pct / 100.0), 1)
+            elif ran > 0:
+                self._last_data["api_calc_range_per_percent"] = round(ran / 100.0, 2)
+                if batt_pct > 0: self._last_data["api_calc_remain_range"] = round(ran * (batt_pct / 100.0), 1)
+
+            cost_per_kwh = safe_float(self.options.get("cost_per_kwh", 4000))
+            gas_price = safe_float(self.options.get("gas_price", 20000))
+            gas_km_per_liter = getattr(self, 'gas_km_per_liter', 15.0)
+
+            total_kwh_charged = safe_float(self._last_data.get("api_total_energy_charged", 0))
+            self._last_data["api_total_charge_cost_est"] = round(total_kwh_charged * cost_per_kwh)
+
+            odo = safe_float(self._last_data.get("34183_00001_00003", self._last_data.get("34199_00000_00000", 0)))
+            if odo > 0 and gas_km_per_liter > 0:
+                self._last_data["api_total_gas_cost"] = round((odo / gas_km_per_liter) * gas_price)
+
         except Exception: pass
+
+    # =================================================================================
+    # THUẬT TOÁN TỰ ĐỘNG SỬA CHỮA TỌA ĐỘ LỊCH SỬ (READ -> SMOOTH/OFFSET -> WRITE)
+    # =================================================================================
+    def fix_historical_trips(self):
+        if not self.vin: return
+        try:
+            trip_file = os.path.join(WWW_DIR, f"vinfast_trips_{self.vin.lower()}.json")
+            if not os.path.exists(trip_file): return
+            
+            with open(trip_file, 'r', encoding='utf-8') as f:
+                trips = json.load(f)
+                
+            modified = False
+            for trip in trips:
+                # Nếu chuyến đi chưa được nắn mượt (chưa có cờ is_smoothed)
+                if not trip.get("is_smoothed", False):
+                    raw_route = trip.get("route", [])
+                    if len(raw_route) > 2:
+                        _LOGGER.info(f"VinFast: Đang nắn lại toạ độ bám đường cho Trip {trip.get('id')}...")
+                        new_route = snap_to_road(raw_route)
+                        if new_route and len(new_route) > 0:
+                            trip["route"] = new_route
+                            trip["is_smoothed"] = True
+                            modified = True
+                        
+                        # Nghỉ 1.5 giây giữa các lần gọi để chống OSRM ban IP
+                        time.sleep(1.5) 
+                    else:
+                        trip["is_smoothed"] = True
+                        modified = True
+
+            if modified:
+                with open(trip_file, 'w', encoding='utf-8') as f:
+                    json.dump(trips, f, ensure_ascii=False)
+                _LOGGER.info("VinFast: Đã xử lý xong toàn bộ lịch sử toạ độ. Vui lòng F5 trình duyệt để cập nhật bản đồ.")
+        except Exception as e:
+            _LOGGER.error(f"VinFast: Lỗi khi xử lý lại toạ độ: {e}")
 
     def _load_state(self):
         if not self.vin: return
@@ -212,10 +275,21 @@ class VinFastAPI:
                         self._charge_calc_soc = mem.get("charge_calc_soc", 0.0)
                         self._charge_start_time = mem.get("charge_start_time", time.time())
                         self._charge_calc_time = mem.get("charge_calc_time", time.time())
+                        self._is_charging = mem.get("is_charging", False)
+                        self._last_is_charging = mem.get("last_is_charging", False)
+                        self._current_charge_max_power = mem.get("current_charge_max_power", 0.0)
+                        
                         lat_start = self._last_data.get("api_last_lat")
                         lon_start = self._last_data.get("api_last_lon")
                         if lat_start and lon_start: self._last_lat_lon = f"{lat_start},{lon_start}"
             except Exception: pass
+        
+        vn = str(self._last_data.get("api_vehicle_name", ""))
+        if vn.lower() in ["0", "1", "unknown", "none", "", "vinfast"]:
+            self._last_data["api_vehicle_name"] = self.vehicle_model_display or "Xe VinFast"
+            
+        # KHỞI CHẠY TIẾN TRÌNH SỬA TỌA ĐỘ LỊCH SỬ NGẦM MỖI KHI RESTART
+        threading.Thread(target=self.fix_historical_trips, daemon=True).start()
 
     def _save_state(self):
         if not self.vin: return
@@ -239,7 +313,10 @@ class VinFastAPI:
                     "charge_start_soc": getattr(self, '_charge_start_soc', 0.0),
                     "charge_calc_soc": getattr(self, '_charge_calc_soc', 0.0),
                     "charge_start_time": getattr(self, '_charge_start_time', time.time()),
-                    "charge_calc_time": getattr(self, '_charge_calc_time', time.time())
+                    "charge_calc_time": getattr(self, '_charge_calc_time', time.time()),
+                    "is_charging": getattr(self, '_is_charging', False),
+                    "last_is_charging": getattr(self, '_last_is_charging', False),
+                    "current_charge_max_power": getattr(self, '_current_charge_max_power', 0.0)
                 },
                 "unix_time": time.time()
             }
@@ -274,10 +351,13 @@ class VinFastAPI:
                 dur_mins = int((end_dt.timestamp() - self._trip_start_time) / 60)
                 start_addr = f"{self._route_coords[0][0]}, {self._route_coords[0][1]}" if self._route_coords else "Unknown"
                 end_addr = f"{self._route_coords[-1][0]}, {self._route_coords[-1][1]}" if self._route_coords else "Unknown"
+                
                 new_trip = {
                     "id": int(end_dt.timestamp()), "date": start_dt.strftime("%d/%m/%Y"), "start_time": start_dt.strftime("%H:%M"),
                     "end_time": end_dt.strftime("%H:%M"), "duration": dur_mins if dur_mins > 0 else 1, "distance": round(dist, 2),
-                    "start_address": start_addr, "end_address": end_addr, "route": snap_to_road(self._route_coords) 
+                    "start_address": start_addr, "end_address": end_addr, 
+                    "route": snap_to_road(self._route_coords), 
+                    "is_smoothed": True # Gắn cờ để đánh dấu Trip này đã dùng Pipeline xịn, không cần sửa lại nữa
                 }
                 trips.insert(0, new_trip) 
                 with open(trip_file, 'w', encoding='utf-8') as f: json.dump(trips[:50], f, ensure_ascii=False)
